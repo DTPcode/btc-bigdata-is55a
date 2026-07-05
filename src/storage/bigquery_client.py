@@ -119,15 +119,14 @@ class BigQueryStorage:
         latest_ts = self.get_latest_timestamp()
         if latest_ts is not None:
             before = len(df)
+            # BigQuery trả về datetime ĐÃ có timezone (tz-aware) — không được
+            # gán thêm tz="UTC" lần nữa (pandas sẽ báo lỗi ValueError vì xung
+            # đột). Dùng pd.Timestamp() trực tiếp, rồi tz_convert nếu cần.
             latest_ts_pd = pd.Timestamp(latest_ts)
             if latest_ts_pd.tzinfo is None:
-
                 latest_ts_pd = latest_ts_pd.tz_localize("UTC")
-
             else:
-
                 latest_ts_pd = latest_ts_pd.tz_convert("UTC")
-
             df = df[df["timestamp"] > latest_ts_pd]
             log.info(f"Upload: lọc incremental — giữ {len(df)}/{before} dòng mới hơn {latest_ts}")
         else:
