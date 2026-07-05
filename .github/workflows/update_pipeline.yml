@@ -7,13 +7,13 @@ name: BTC Big Data Pipeline - Update
 
 on:
   schedule:
-    - cron: '0 * * * *'   # Đầu mỗi giờ. KHÔNG rút ngắn — sẽ vượt quota free
-  workflow_dispatch:        # Cho phép bấm chạy thủ công để test
+    - cron: "0 * * * *" # Đầu mỗi giờ. KHÔNG rút ngắn — sẽ vượt quota free
+  workflow_dispatch: # Cho phép bấm chạy thủ công để test
     inputs:
       mode:
-        description: 'Chế độ chạy'
+        description: "Chế độ chạy"
         required: true
-        default: 'update'
+        default: "update"
         type: choice
         options: [update, test]
 
@@ -29,8 +29,8 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.12"
+          cache: "pip"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
