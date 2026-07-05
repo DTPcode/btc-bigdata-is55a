@@ -1,6 +1,4 @@
 """
-src/storage/bigquery_client.py
-=====================================================================
 TẦNG STORAGE — Lưu trữ và truy vấn dữ liệu trên BigQuery (Data Warehouse).
 
 Các điểm TỐI ƯU HÓA quan trọng trong module này:
@@ -10,8 +8,12 @@ Các điểm TỐI ƯU HÓA quan trọng trong module này:
    tính phí (~$0.01/200MB), Batch Load hoàn toàn MIỄN PHÍ
 3. Chunked Upload — khi upload lịch sử lớn (~50.000 dòng), chia nhỏ
    thành từng chunk để tránh timeout và dễ retry nếu 1 chunk lỗi
-4. Incremental Load — chỉ upload dòng có timestamp MỚI HƠN dữ liệu đã
-   có trong BigQuery, tránh trùng lặp (deduplication tại nguồn)
+4. UPSERT qua DDL swap (KHÔNG dùng MERGE/DML) — BigQuery Sandbox (project
+   chưa bật Billing Account) CẤM mọi lệnh DML (MERGE/UPDATE/DELETE).
+   Thay vào đó, module này dùng CREATE TABLE ... AS SELECT (DDL, được
+   phép trong Sandbox) để gộp dữ liệu cũ + mới, khử trùng theo timestamp,
+   rồi ALTER TABLE RENAME để thay thế bảng chính. Kết quả tương đương
+   UPSERT nhưng không cần bật Billing / nhập thẻ.
 5. Partitioning + Clustering — table được partition theo NGÀY và
    cluster theo timestamp, giúp mọi query filter theo thời gian chỉ
    scan đúng phần dữ liệu cần, tiết kiệm quota 1TB/tháng miễn phí
@@ -20,6 +22,7 @@ Các điểm TỐI ƯU HÓA quan trọng trong module này:
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -36,6 +39,9 @@ log = get_logger(__name__)
 # Chia nhỏ mỗi lần upload thành chunk 10.000 dòng — cân bằng giữa số lượng
 # API call (ít quá thì mỗi call quá nặng, dễ timeout) và overhead mỗi call
 CHUNK_SIZE = 10_000
+
+# Cột dùng làm KHÓA để so khớp khi MERGE — 1 timestamp = 1 nến duy nhất
+_MERGE_KEY = "timestamp"
 
 
 class BigQueryStorage:
@@ -56,6 +62,7 @@ class BigQueryStorage:
             project=settings.gcp_project_id,
             credentials=credentials,
         )
+        self._dataset_id = f"{settings.gcp_project_id}.{settings.bq_dataset_id}"
         self._table_id = settings.full_table_id
         log.info(f"BigQueryStorage kết nối tới: {self._table_id}")
 
@@ -66,30 +73,29 @@ class BigQueryStorage:
         Tạo dataset + table nếu chưa tồn tại. An toàn để gọi nhiều lần
         (idempotent) — không lỗi nếu đã tồn tại rồi.
         """
-        dataset_ref = bigquery.Dataset(f"{settings.gcp_project_id}.{settings.bq_dataset_id}")
+        dataset_ref = bigquery.Dataset(self._dataset_id)
         dataset_ref.location = settings.bq_location
         self._client.create_dataset(dataset_ref, exists_ok=True)
         log.info(f"Dataset '{settings.bq_dataset_id}' sẵn sàng (location={settings.bq_location})")
 
         table = bigquery.Table(self._table_id, schema=SCHEMA_OHLCV)
-        # Partition theo NGÀY dựa trên cột timestamp — mọi query có
-        # WHERE timestamp >= X sẽ chỉ scan các partition liên quan
         table.time_partitioning = bigquery.TimePartitioning(
             type_=bigquery.TimePartitioningType.DAY,
             field="timestamp",
         )
-        # Cluster theo timestamp — tối ưu thêm cho query sort/filter theo thời gian
         table.clustering_fields = CLUSTERING_FIELDS
 
         self._client.create_table(table, exists_ok=True)
         log.info(f"Table '{self._table_id}' sẵn sàng (partitioned by DAY, clustered by timestamp)")
 
-    # -- Ghi dữ liệu (Batch Load - miễn phí) ------------------------------
+    # -- Ghi dữ liệu (Batch Load + UPSERT qua DDL swap - miễn phí, không cần Billing) --
 
     def get_latest_timestamp(self) -> datetime | None:
         """
         Lấy timestamp mới nhất hiện có trong BigQuery.
-        Dùng để lọc incremental — chỉ upload dòng MỚI HƠN mốc này.
+        Dùng để LOG/kiểm tra tình trạng dữ liệu, KHÔNG dùng để lọc trước
+        khi upload nữa (cơ chế upload mới dùng DDL swap, tự khử trùng
+        theo timestamp, nên không cần lọc thủ công ở bước này).
         Trả về None nếu table rỗng (lần chạy đầu tiên).
         """
         query = f"SELECT MAX(timestamp) AS max_ts FROM `{self._table_id}`"
@@ -100,14 +106,28 @@ class BigQueryStorage:
 
     def upload(self, df: pd.DataFrame) -> int:
         """
-        Upload DataFrame lên BigQuery bằng Batch Load (KHÔNG Streaming Insert).
+        Upload DataFrame lên BigQuery bằng cơ chế UPSERT — nhưng dùng DDL
+        (CREATE TABLE ... AS SELECT + RENAME) thay vì DML (MERGE).
 
-        Tự động:
-        - Lọc chỉ giữ dòng có timestamp MỚI HƠN dữ liệu đã có (incremental)
-        - Chia thành chunk nếu dữ liệu lớn (tránh timeout 1 request khổng lồ)
-        - Gắn cột _loaded_at để biết dòng này được ghi lúc nào
+        Vì sao KHÔNG dùng MERGE trực tiếp:
+        BigQuery Sandbox (project CHƯA bật Billing Account) CẤM mọi câu
+        lệnh DML (MERGE/UPDATE/DELETE/INSERT-qua-query) — báo lỗi 403
+        "Billing has not been enabled". Vì nhóm không muốn nhập thẻ chỉ
+        để dùng free tier, giải pháp là dùng DDL (CREATE TABLE AS SELECT,
+        ALTER TABLE RENAME) — DDL vẫn được phép trong Sandbox, không cần
+        Billing, và SELECT/Load Job cũng không cần Billing (chỉ DML bị chặn).
 
-        Trả về số dòng THỰC SỰ đã upload (0 nếu không có gì mới).
+        Cách hoạt động:
+        1. Load dữ liệu mới vào bảng TẠM (staging) — bằng Load Job (an toàn,
+           không cần Billing)
+        2. Tạo 1 bảng MỚI bằng CREATE TABLE ... AS SELECT: gộp bảng chính
+           (dữ liệu cũ) + bảng staging (dữ liệu mới), khử trùng theo
+           timestamp — dòng nào trùng thì giữ bản ghi có _loaded_at MỚI
+           NHẤT (tức bản ghi mới luôn thắng, tự sửa lại nến chưa đóng)
+        3. Xóa bảng chính cũ, ĐỔI TÊN bảng mới thành tên bảng chính
+        4. Dọn dẹp bảng tạm
+
+        Trả về tổng số dòng trong bảng sau khi upsert xong.
         """
         if df.empty:
             log.info("Upload: DataFrame rỗng, không có gì để tải lên")
@@ -115,49 +135,86 @@ class BigQueryStorage:
 
         df = df.copy()
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
-
-        latest_ts = self.get_latest_timestamp()
-        if latest_ts is not None:
-            before = len(df)
-            # BigQuery trả về datetime ĐÃ có timezone (tz-aware) — không được
-            # gán thêm tz="UTC" lần nữa (pandas sẽ báo lỗi ValueError vì xung
-            # đột). Dùng pd.Timestamp() trực tiếp, rồi tz_convert nếu cần.
-            latest_ts_pd = pd.Timestamp(latest_ts)
-            if latest_ts_pd.tzinfo is None:
-                latest_ts_pd = latest_ts_pd.tz_localize("UTC")
-            else:
-                latest_ts_pd = latest_ts_pd.tz_convert("UTC")
-            df = df[df["timestamp"] > latest_ts_pd]
-            log.info(f"Upload: lọc incremental — giữ {len(df)}/{before} dòng mới hơn {latest_ts}")
-        else:
-            log.info(f"Upload: table đang rỗng — sẽ tải lên toàn bộ {len(df)} dòng (lần khởi tạo)")
-
-        if df.empty:
-            log.info("Upload: không có dòng mới sau khi lọc — bỏ qua")
-            return 0
-
         df["_loaded_at"] = datetime.now(timezone.utc)
 
-        total_uploaded = 0
+        suffix = uuid.uuid4().hex[:8]
+        staging_table_id = f"{self._dataset_id}.__staging_{suffix}"
+        swap_table_id = f"{self._dataset_id}.__swap_{suffix}"
+        swap_table_short_name = f"{settings.table_ohlcv}"  # Tên ngắn để RENAME TO
+
+        try:
+            self._load_to_staging(df, staging_table_id)
+            self._create_merged_table_via_ctas(staging_table_id, swap_table_id)
+            self._swap_tables(swap_table_id, swap_table_short_name)
+
+            total_rows = self.count_rows()
+            log.info(f"✅ Upsert hoàn tất (qua DDL swap): table hiện có {total_rows:,} dòng")
+            return total_rows
+        finally:
+            self._client.delete_table(staging_table_id, not_found_ok=True)
+            self._client.delete_table(swap_table_id, not_found_ok=True)
+
+    def _load_to_staging(self, df: pd.DataFrame, staging_table_id: str) -> None:
+        """Load toàn bộ DataFrame vào bảng tạm, chia chunk nếu dữ liệu lớn."""
         n_chunks = (len(df) + CHUNK_SIZE - 1) // CHUNK_SIZE
         for i in range(0, len(df), CHUNK_SIZE):
             chunk = df.iloc[i : i + CHUNK_SIZE]
-            self._load_chunk(chunk)
-            total_uploaded += len(chunk)
-            log.info(f"Upload: chunk {i // CHUNK_SIZE + 1}/{n_chunks} xong ({len(chunk)} dòng)")
-
-        log.info(f"✅ Upload hoàn tất: {total_uploaded} dòng mới vào '{self._table_id}'")
-        return total_uploaded
+            write_mode = (
+                bigquery.WriteDisposition.WRITE_TRUNCATE
+                if i == 0
+                else bigquery.WriteDisposition.WRITE_APPEND
+            )
+            self._load_chunk(chunk, staging_table_id, write_mode)
+            log.info(f"Upload: nạp staging chunk {i // CHUNK_SIZE + 1}/{n_chunks} ({len(chunk)} dòng)")
 
     @with_retry(max_attempts=3)
-    def _load_chunk(self, chunk: pd.DataFrame) -> None:
-        """Upload 1 chunk — có retry riêng để chunk lỗi không làm hỏng cả batch."""
-        job_config = bigquery.LoadJobConfig(
-            schema=SCHEMA_OHLCV,
-            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
-        )
-        job = self._client.load_table_from_dataframe(chunk, self._table_id, job_config=job_config)
-        job.result()  # Chờ job hoàn thành, raise lỗi nếu job fail
+    def _load_chunk(self, chunk: pd.DataFrame, table_id: str, write_mode: str) -> None:
+        """Load 1 chunk vào table chỉ định — có retry riêng cho từng chunk."""
+        job_config = bigquery.LoadJobConfig(schema=SCHEMA_OHLCV, write_disposition=write_mode)
+        job = self._client.load_table_from_dataframe(chunk, table_id, job_config=job_config)
+        job.result()
+
+    @with_retry(max_attempts=2)
+    def _create_merged_table_via_ctas(self, staging_table_id: str, swap_table_id: str) -> None:
+        """
+        Tạo bảng mới = gộp (bảng chính + staging), khử trùng theo timestamp,
+        giữ bản ghi có _loaded_at mới nhất. Đây là DDL (CREATE TABLE AS
+        SELECT), KHÔNG phải DML, nên không bị Sandbox chặn.
+        """
+        ctas_sql = f"""
+            CREATE OR REPLACE TABLE `{swap_table_id}`
+            PARTITION BY DATE({_MERGE_KEY})
+            CLUSTER BY {_MERGE_KEY}
+            AS
+            SELECT * EXCEPT(_rn) FROM (
+                SELECT *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY {_MERGE_KEY}
+                        ORDER BY _loaded_at DESC
+                    ) AS _rn
+                FROM (
+                    SELECT * FROM `{self._table_id}`
+                    UNION ALL
+                    SELECT * FROM `{staging_table_id}`
+                )
+            )
+            WHERE _rn = 1
+        """
+        job = self._client.query(ctas_sql)
+        job.result()
+        log.info("Upload: đã tạo bảng gộp (dedup theo timestamp) qua CREATE TABLE AS SELECT")
+
+    @with_retry(max_attempts=2)
+    def _swap_tables(self, swap_table_id: str, short_name: str) -> None:
+        """
+        Xóa bảng chính cũ, đổi tên bảng mới (đã gộp + dedup) thành bảng
+        chính. Cả DROP và RENAME đều là DDL — không cần Billing.
+        """
+        self._client.delete_table(self._table_id, not_found_ok=True)
+        rename_sql = f"ALTER TABLE `{swap_table_id}` RENAME TO `{short_name}`"
+        job = self._client.query(rename_sql)
+        job.result()
+        log.info(f"Upload: đã đổi tên bảng gộp thành '{self._table_id}'")
 
     # -- Đọc dữ liệu (Query - tối ưu quota) --------------------------------
 
