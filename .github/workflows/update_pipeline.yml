@@ -1,0 +1,60 @@
+# =====================================================================
+# Tự động chạy pipeline UPDATE mỗi 1 giờ.
+# ~1 phút/lần × 24 × 30 ngày = ~720 phút/tháng (free tier: 2000 phút/tháng)
+# =====================================================================
+
+name: BTC Big Data Pipeline - Update
+
+on:
+  schedule:
+    - cron: '0 * * * *'   # Đầu mỗi giờ. KHÔNG rút ngắn — sẽ vượt quota free
+  workflow_dispatch:        # Cho phép bấm chạy thủ công để test
+    inputs:
+      mode:
+        description: 'Chế độ chạy'
+        required: true
+        default: 'update'
+        type: choice
+        options: [update, test]
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Setup Google credentials
+        run: echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > credentials.json
+
+      - name: Setup environment variables
+        run: |
+          cat > .env << EOF
+          GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }}
+          BQ_DATASET_ID=btc_bigdata
+          BQ_LOCATION=US
+          GOOGLE_APPLICATION_CREDENTIALS=./credentials.json
+          SYMBOL=BTCUSDT
+          INTERVAL=1h
+          INCREMENTAL_LOOKBACK=200
+          LOG_LEVEL=INFO
+          LOG_DIR=./logs
+          EOF
+
+      - name: Run pipeline
+        run: python scripts/run_pipeline.py --mode "${{ github.event.inputs.mode || 'update' }}"
+
+      - name: Cleanup secrets
+        if: always()
+        run: rm -f credentials.json .env

@@ -1,0 +1,24 @@
+# Môi trường ảo
+venv/
+.venv/
+env/
+
+# Secrets - KHÔNG BAO GIỜ commit
+.env
+credentials.json
+*.json.key
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Logs & data tạm
+logs/*.log
+data/*.parquet
+data/*.csv
+
+# IDE
+.vscode/
+.idea/
