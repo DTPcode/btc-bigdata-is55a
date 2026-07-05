@@ -13,7 +13,8 @@ Chạy local:
 Sau khi chạy, xem tài liệu API tự sinh tại:
     http://localhost:8000/docs
 """
-
+import numpy as np
+import pandas as pd
 import sys
 from pathlib import Path
 
@@ -94,6 +95,9 @@ def get_ohlcv(
         if "_loaded_at" in df.columns:
             df = df.drop(columns=["_loaded_at"])  # Cột nội bộ, Frontend không cần
 
+                # [api] Xử lý NaN -> None để tránh lỗi JSON "Out of range float values"
+        df = df.replace({np.nan: None})
+        df = df.where(pd.notnull(df), None)
         return {
             "symbol": "BTCUSDT",
             "timeframe": "1h",
