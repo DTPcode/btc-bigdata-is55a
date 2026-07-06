@@ -51,3 +51,33 @@ SCHEMA_OHLCV = [
 # này, giúp các query filter theo timestamp (đã partition theo ngày) VÀ
 # sort theo thời gian chạy nhanh hơn, scan ít dữ liệu hơn.
 CLUSTERING_FIELDS = ["timestamp"]
+
+# Schema cho bảng lịch sử % chênh lệch giá P2P (Binance P2P vs tỷ giá
+# quốc tế) — mỗi dòng là 1 lần đo (mỗi lần chạy --mode update, ~1h/lần).
+# Bảng này KHÔNG dùng cơ chế UPSERT/DDL-swap như OHLCV, vì đây là dữ
+# liệu dạng LOG theo thời gian (mỗi lần đo là 1 sự kiện độc lập, không
+# có khái niệm "sửa lại dòng cũ") — chỉ cần APPEND đơn giản.
+SCHEMA_P2P_SPREAD = [
+    bigquery.SchemaField("timestamp", "TIMESTAMP", mode="REQUIRED",
+                          description="Thời điểm đo giá P2P (UTC)"),
+    bigquery.SchemaField("asset", "STRING", mode="REQUIRED",
+                          description="Tài sản quy đổi, VD: USDT"),
+    bigquery.SchemaField("fiat", "STRING", mode="REQUIRED",
+                          description="Tiền pháp định, VD: VND"),
+    bigquery.SchemaField("trade_type", "STRING", mode="REQUIRED",
+                          description="SELL hoặc BUY (chiều giao dịch trên P2P)"),
+    bigquery.SchemaField("p2p_price", "FLOAT64", mode="REQUIRED",
+                          description="Giá trung bình (của nhiều mẫu) top N quảng cáo trên Binance P2P"),
+    bigquery.SchemaField("p2p_price_min", "FLOAT64",
+                          description="Giá thấp nhất trong các mẫu đã lấy (biến động trong lần chạy)"),
+    bigquery.SchemaField("p2p_price_max", "FLOAT64",
+                          description="Giá cao nhất trong các mẫu đã lấy (biến động trong lần chạy)"),
+    bigquery.SchemaField("samples", "INT64",
+                          description="Số lần lấy mẫu thực tế đã dùng để tính trung bình"),
+    bigquery.SchemaField("market_price", "FLOAT64", mode="REQUIRED",
+                          description="Tỷ giá USD/VND quốc tế tại thời điểm đo"),
+    bigquery.SchemaField("spread_pct", "FLOAT64", mode="REQUIRED",
+                          description="% chênh lệch = (market - p2p) / market * 100"),
+    bigquery.SchemaField("_loaded_at", "TIMESTAMP",
+                          description="Thời điểm pipeline ghi dòng này vào BigQuery"),
+]

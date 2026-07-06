@@ -19,8 +19,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # Tìm và load file .env ở thư mục gốc project (dù chạy từ đâu cũng tìm ra)
+# override=True: giá trị trong .env LUÔN ưu tiên hơn biến môi trường hệ
+# thống đã set sẵn (tránh trường hợp máy có biến cũ sót lại gây nhầm lẫn
+# rất khó debug, như GCP_PROJECT_ID bị set nhầm từ lần test trước)
 _ROOT_DIR = Path(__file__).resolve().parent.parent
-load_dotenv(_ROOT_DIR / ".env")
+load_dotenv(_ROOT_DIR / ".env", override=True)
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,17 @@ class Settings:
     # -- Logging --
     log_level: str
     log_dir: str
+
+    # -- P2P Spread (Binance P2P vs tỷ giá quốc tế) --
+    p2p_asset: str
+    p2p_fiat: str
+    p2p_rows: int
+    p2p_samples: int
+    p2p_sample_delay_sec: float
+    fx_api_url: str
+
+    # -- Tax (thuế giao dịch crypto) --
+    tax_vn_rate: float
 
     # -- Đường dẫn hệ thống --
     root_dir: Path
@@ -100,6 +114,24 @@ def load_settings() -> Settings:
 
         log_level = os.getenv("LOG_LEVEL", "INFO"),
         log_dir   = os.getenv("LOG_DIR", "./logs"),
+
+        # Mặc định: USDT/VND, lấy trung bình 10 quảng cáo bán uy tín nhất
+        p2p_asset  = os.getenv("P2P_ASSET", "USDT"),
+        p2p_fiat   = os.getenv("P2P_FIAT", "VND"),
+        p2p_rows   = int(os.getenv("P2P_ROWS", "10")),
+        # Lấy mẫu nhiều lần/lần chạy để "trung bình hoá" giống tinh thần
+        # OHLCV (tổng hợp theo thời gian) thay vì tin vào 1 điểm tức thời.
+        # 3 mẫu x cách nhau 3s ~ 9s/chiều, không tốn quá nhiều thời gian
+        # trong 1 lần chạy pipeline (--mode update chạy mỗi giờ).
+        p2p_samples          = int(os.getenv("P2P_SAMPLES", "3")),
+        p2p_sample_delay_sec = float(os.getenv("P2P_SAMPLE_DELAY_SEC", "3")),
+        # API tỷ giá miễn phí, không cần key (open.er-api.com)
+        fx_api_url = os.getenv("FX_API_URL", "https://open.er-api.com/v6/latest/USD"),
+
+        # Thuế TNCN chuyển nhượng tài sản số VN — 0.1% trên giá trị bán,
+        # hiệu lực từ 01/07/2026 theo Nghị định mới (xem README/báo cáo
+        # để trích dẫn nguồn chính xác nếu cần nộp kèm)
+        tax_vn_rate = float(os.getenv("TAX_VN_RATE", "0.001")),
 
         root_dir = _ROOT_DIR,
     )
