@@ -168,7 +168,7 @@ class IndicatorEngine:
         df["vol_ma_20"] = ta.sma(volume, length=20)
 
         n_before = len(df)
-        df = df.dropna(subset=["rsi_14", "macd", "bb_upper"]).reset_index(drop=True)
+        df = df.dropna(subset=["rsi_14", "macd", "bb_upper", "ema_50", "ema_200"]).reset_index(drop=True)
         n_after = len(df)
         log.info(f"Processing: tính xong {n_after} nến có đủ chỉ báo (loại {n_before - n_after} dòng warmup NaN)")
 

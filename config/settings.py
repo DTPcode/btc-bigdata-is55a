@@ -110,7 +110,7 @@ def load_settings() -> Settings:
         symbol               = os.getenv("SYMBOL", "BTCUSDT"),
         interval              = os.getenv("INTERVAL", "1h"),
         history_start_date   = os.getenv("HISTORY_START_DATE", "2020-01-01"),
-        incremental_lookback = int(os.getenv("INCREMENTAL_LOOKBACK", "200")),
+        incremental_lookback = int(os.getenv("INCREMENTAL_LOOKBACK", "500")),
 
         log_level = os.getenv("LOG_LEVEL", "INFO"),
         log_dir   = os.getenv("LOG_DIR", "./logs"),
